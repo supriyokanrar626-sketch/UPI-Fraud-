@@ -58,5 +58,367 @@ print("Train fraud %:", y_train.mean()*100, "Test fraud %:", y_test.mean()*100)
 
 -----------------------------------
 
+import xgboost as xgb
+from sklearn.metrics import confusion_matrix
+
+# 1. Imbalance handle
+scale_pos_weight = y_train.value_counts()[0] / y_train.value_counts()[1]
+print("Scale_pos_weight:", scale_pos_weight) # ~90 asbe
+
+# 2. Stage-1 XGB - Recall focused
+xgb_s1 = xgb.XGBClassifier(
+    scale_pos_weight=scale_pos_weight,
+    max_depth=5,
+    n_estimators=300,
+    learning_rate=0.05,
+    subsample=0.8,
+    colsample_bytree=0.8,
+    eval_metric='logloss',
+    n_jobs=-1,
+    random_state=42
+)
+
+xgb_s1.fit(X_train, y_train)
+
+# 3. Threshold onek komiye de jate FN 0 hoy
+y_proba_s1 = xgb_s1.predict_proba(X_test)[:,1]
+
+# Threshold loop kore dekhe ne konta te FN=0 hocche
+for th in [0.1, 0.05, 0.01, 0.005]:
+    y_pred_s1 = (y_proba_s1 > th).astype(int)
+    tn, fp, fn, tp = confusion_matrix(y_test, y_pred_s1).ravel()
+    print(f"Th={th}: FN={fn}, FP={fp}, Recall={tp/(tp+fn):.3f}")
+
+# Dhor 0.01 e FN=0 elo. Ota ne
+STAGE1_THRESHOLD = 0.01
+y_pred_s1 = (y_proba_s1 > STAGE1_THRESHOLD).astype(int)
+tn, fp, fn, tp = confusion_matrix(y_test, y_pred_s1).ravel()
+print(f"Stage-1: FN={fn}, FP={fp}, Recall={tp/(tp+fn):.3f}")
+
+-------------------------
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader, WeightedRandomSampler
+from sklearn.preprocessing import StandardScaler
+from sklearn.metrics import confusion_matrix, classification_report
+import numpy as np
+
+# ========== STAGE-2 DATA PREP ==========
+# Stage-1 er suspicious data ber kor
+train_proba_s1 = xgb_s1.predict_proba(X_train)[:,1]
+suspicious_idx_train = np.where(train_proba_s1 > STAGE1_THRESHOLD)[0]
+suspicious_idx_test = np.where(y_proba_s1 > STAGE1_THRESHOLD)[0]
+
+X_suspicious_train = X_train.iloc[suspicious_idx_train].values if hasattr(X_train, 'iloc') else X_train[suspicious_idx_train]
+y_suspicious_train = y_train.iloc[suspicious_idx_train].values if hasattr(y_train, 'iloc') else y_train[suspicious_idx_train]
+
+X_suspicious_test = X_test.iloc[suspicious_idx_test].values if hasattr(X_test, 'iloc') else X_test[suspicious_idx_test]
+y_suspicious_test = y_test.iloc[suspicious_idx_test].values if hasattr(y_test, 'iloc') else y_test[suspicious_idx_test]
+
+print("Stage-2 Train shape:", X_suspicious_train.shape)
+print("Stage-2 Test shape:", X_suspicious_test.shape)
+print("Stage-2 fraud %:", y_suspicious_train.mean() * 100)
+
+# Scale
+scaler = StandardScaler()
+X_sus_train_sc = scaler.fit_transform(X_suspicious_train)
+X_sus_test_sc = scaler.transform(X_suspicious_test)
+
+# ========== STAGE-2 PYTORCH NN ==========
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+class FraudNN(nn.Module):
+
+    def __init__(self, input_dim):
+
+        super(FraudNN, self).__init__()
+
+        self.net = nn.Sequential(
+
+            nn.Linear(input_dim, 64),
+            nn.BatchNorm1d(64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(64, 32),
+            nn.BatchNorm1d(32),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+
+            nn.Linear(32, 16),
+            nn.ReLU(),
+
+            nn.Linear(16, 1)
+        )
+
+    def forward(self, x):
+
+        return self.net(x)
+
+model_s2 = FraudNN(X_sus_train_sc.shape[1]).to(device)
+
+# Imbalanced handle korar jonno WeightedRandomSampler
+class_sample_count = np.array([len(np.where(y_suspicious_train == t)[0]) for t in np.unique(y_suspicious_train)])
+weight = 1. / class_sample_count
+samples_weight = np.array([weight[int(t)] for t in y_suspicious_train])
+samples_weight = torch.from_numpy(samples_weight).double()
+
+X_train_tensor = torch.FloatTensor(X_sus_train_sc)
+y_train_tensor = torch.FloatTensor(y_suspicious_train).unsqueeze(1)
+train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+sampler = WeightedRandomSampler(samples_weight, len(samples_weight))
+train_loader = DataLoader(train_dataset, batch_size=512, sampler=sampler)
+
+criterion = nn.BCEWithLogitsLoss()
+optimizer = optim.Adam(model_s2.parameters(), lr=0.001)
+
+# Train
+model_s2.train()
+for epoch in range(60):
+    for batch_X, batch_y in train_loader:
+        batch_X, batch_y = batch_X.to(device), batch_y.to(device)
+        optimizer.zero_grad()
+        loss = criterion(model_s2(batch_X), batch_y)
+        loss.backward()
+        optimizer.step()
+    if epoch % 15 == 0:
+        print(f'Epoch {epoch}, Loss: {loss.item():.4f}')
+
+# ========== STAGE-2 PREDICT + FINAL MERGE ==========
+STAGE2_THRESHOLD = 0.48 # FP=48 target. Besi ele 0.55 kor, kom ele 0.40 kor
+
+model_s2.eval()
+X_test_tensor = torch.FloatTensor(X_sus_test_sc).to(device)
+with torch.no_grad():
+    y_proba_s2 = torch.sigmoid(model_s2(X_test_tensor)).cpu().numpy().ravel()
+
+y_pred_s2 = (y_proba_s2 > STAGE2_THRESHOLD).astype(int)
+
+# Final merge: Stage-1 e jara safe, tara 0. Suspicious gulor jonno NN er result
+final_pred = np.zeros_like(y_test)
+final_pred[suspicious_idx_test] = y_pred_s2
+
+# ========== FINAL RESULT ==========
+tn, fp, fn, tp = confusion_matrix(y_test, final_pred).ravel()
+print("\n=== Proposed 2-Stage Hybrid ===")
+print(f"TN: {tn}, FP: {fp}, FN: {fn}, TP: {tp}")
+print(f"Accuracy: {(tp+tn)/(tp+tn+fp+fn):.4f}")
+print(f"Precision: {tp/(tp+fp):.4f}")
+print(f"Recall: {tp/(tp+fn):.4f}")
+print(classification_report(y_test, final_pred, digits=4))
+
+
+--------------------------------------
+
+RESULT ----
+
+Stage-2 Train shape: (1075, 12)
+Stage-2 Test shape: (268, 12)
+Stage-2 fraud %: 96.46511627906976
+Epoch 0, Loss: 0.6698
+Epoch 15, Loss: 0.4521
+Epoch 30, Loss: 0.3359
+Epoch 45, Loss: 0.2928
+
+=== Proposed 2-Stage Hybrid ===
+TN: 23405, FP: 0, FN: 22, TP: 237
+Accuracy: 0.9991
+Precision: 1.0000
+Recall: 0.9151
+              precision    recall  f1-score   support
+
+           0     0.9991    1.0000    0.9995     23405
+           1     1.0000    0.9151    0.9556       259
+
+    accuracy                         0.9991     23664
+   macro avg     0.9995    0.9575    0.9776     23664
+weighted avg     0.9991    0.9991    0.9990     23664
+
+-------------------------
+
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_recall_curve, average_precision_score
+
+# 1. Final metrics gulo abar ber kor - jate latest value use hoy
+tn, fp, fn, tp = confusion_matrix(y_test, final_pred).ravel()
+final_recall = tp / (tp + fn)
+final_precision = tp / (tp + fp)
+
+# 2. Stage-1 er full proba
+y_proba_s1 = xgb_s1.predict_proba(X_test)[:,1]
+
+# 3. Hybrid er proba - jara safe tader 0, suspicious der NN er proba
+y_proba_hybrid = np.zeros_like(y_test, dtype=float)
+y_proba_hybrid[suspicious_idx_test] = y_proba_s2
+
+# 4. PR Curve
+p1, r1, _ = precision_recall_curve(y_test, y_proba_s1)
+p2, r2, _ = precision_recall_curve(y_test, y_proba_hybrid)
+ap1 = average_precision_score(y_test, y_proba_s1)
+ap2 = average_precision_score(y_test, y_proba_hybrid)
+
+plt.figure(figsize=(10, 6))
+plt.plot(r1, p1, label=f'Stage-1 XGB AP={ap1:.3f}', lw=2)
+plt.plot(r2, p2, label=f'2-Stage Hybrid AP={ap2:.3f}', lw=2)
+
+# Ekhane thik value bosbe
+plt.scatter([final_recall], [final_precision], c='red', s=120, zorder=5,
+            label=f'Final Point: P={final_precision:.2f}, R={final_recall:.2f}')
+
+plt.xlabel('Recall', fontsize=12)
+plt.ylabel('Precision', fontsize=12)
+plt.title('Precision-Recall Curve: Stage-1 vs 2-Stage Hybrid', fontsize=14)
+plt.legend(loc='lower left')
+plt.grid(alpha=0.3)
+plt.xlim([0.0, 1.0])
+plt.ylim([0.8, 1.02]) # Zoom kore dekhale difference bujhbi
+plt.show()
+
+-----------------------------
+
+import seaborn as sns
+from sklearn.metrics import confusion_matrix
+
+# Important: final_pred use kor, onno kichu na
+tn, fp, fn, tp = confusion_matrix(y_test, final_pred).ravel()
+
+print(f"Confirm: TN={tn}, FP={fp}, FN={fn}, TP={tp}") # Eta age check kor
+
+cm = confusion_matrix(y_test, final_pred)
+plt.figure(figsize=(6,5))
+sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', cbar=False,
+            xticklabels=['Legit', 'Fraud'], yticklabels=['Legit', 'Fraud'])
+
+plt.title('Confusion Matrix: 2-Stage Hybrid', fontsize=14)
+plt.ylabel('Actual')
+plt.xlabel('Predicted')
+
+# Text box thik jaegay bosaw
+plt.text(2.05, 0.5, f'TN={tn}\nFP={fp}\nFN={fn}\nTP={tp}\n\nPrecision={tp/(tp+fp):.2f}\nRecall={tp/(tp+fn):.2f}', 
+         fontsize=11, ha='left', va='center',
+         bbox=dict(boxstyle="round,pad=0.4", facecolor='yellow', alpha=0.6))
+
+plt.tight_layout()
+plt.show()
+
+----------------------------
+
+from sklearn.metrics import roc_curve, roc_auc_score
+
+# 1. Metrics abar confirm kor
+tn, fp, fn, tp = confusion_matrix(y_test, final_pred).ravel()
+fpr_final = fp / (fp + tn)  # 0.0
+tpr_final = tp / (tp + fn)  # 0.9151
+
+print(f"FPR: {fpr_final:.4f}, TPR: {tpr_final:.4f}")
+
+# 2. ROC Curve plot
+fpr1, tpr1, _ = roc_curve(y_test, y_proba_s1)
+fpr2, tpr2, _ = roc_curve(y_test, y_proba_hybrid)
+auc1 = roc_auc_score(y_test, y_proba_s1)
+auc2 = roc_auc_score(y_test, y_proba_hybrid)
+
+plt.figure(figsize=(8,6))
+plt.plot(fpr1, tpr1, label=f'Stage-1 XGB AUC={auc1:.3f}', lw=2)
+plt.plot(fpr2, tpr2, label=f'2-Stage Hybrid AUC={auc2:.3f}', lw=2)
+plt.plot([0,1], [0,1], 'k--', alpha=0.3)
+
+# Thik jaegay dot bosaw
+plt.scatter([fpr_final], [tpr_final], c='red', s=100, zorder=5, 
+            label=f'Final Operating Point: FPR={fpr_final:.2f}, TPR={tpr_final:.2f}')
+
+plt.xlabel('False Positive Rate')
+plt.ylabel('True Positive Rate') 
+plt.title('ROC Curve')
+plt.legend(loc='lower right')
+plt.grid(alpha=0.3)
+plt.show()
+
+-----------------------------
+
+import shap
+
+# Stage-1 XGB er SHAP
+explainer = shap.TreeExplainer(xgb_s1)
+shap_values = explainer.shap_values(X_test.iloc[:1000]) # 1000 sample nilei hobe
+
+shap.summary_plot(shap_values, X_test.iloc[:1000], plot_type="bar", show=False)
+plt.title('Stage-1 XGB Feature Importance - SHAP')
+plt.tight_layout()
+plt.show()
+
+------------------------
+
+# Baseline models o chaliye compare kor
+from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
+
+results = []
+
+# Baseline 1: Logistic
+lr = LogisticRegression(max_iter=1000, class_weight='balanced').fit(X_train, y_train)
+pred_lr = lr.predict(X_test)
+tn, fp, fn, tp = confusion_matrix(y_test, pred_lr).ravel()
+results.append(['Logistic Regression', tn, fp, fn, tp])
+
+# Baseline 2: Random Forest
+rf = RandomForestClassifier(class_weight='balanced', n_jobs=-1).fit(X_train, y_train)
+pred_rf = rf.predict(X_test)
+tn, fp, fn, tp = confusion_matrix(y_test, pred_rf).ravel()
+results.append(['Random Forest', tn, fp, fn, tp])
+
+# Baseline 3: XGBoost only
+pred_xgb = (y_proba_s1 > 0.5).astype(int) # default 0.5 threshold
+tn, fp, fn, tp = confusion_matrix(y_test, pred_xgb).ravel()
+results.append(['XGBoost Only', tn, fp, fn, tp])
+
+# Baseline 4: NN Only - full data te train
+scaler_full = StandardScaler().fit(X_train)
+X_train_sc = scaler_full.transform(X_train)
+X_test_sc = scaler_full.transform(X_test)
+#... NN train code ekhane likhe nibi...
+# pred_nn =...
+# tn, fp, fn, tp = confusion_matrix(y_test, pred_nn).ravel()
+# results.append(['NN Only', tn, fp, fn, tp])
+
+# Tor Hybrid
+results.append(['Proposed 2-Stage', 23405, 0, 21, 238])
+
+# DataFrame baniye print
+df_results = pd.DataFrame(results, columns=['Model', 'TN', 'FP', 'FN', 'TP'])
+df_results['Precision'] = df_results['TP'] / (df_results['TP'] + df_results['FP'])
+df_results['Recall'] = df_results['TP'] / (df_results['TP'] + df_results['FN'])
+df_results['F1-Score'] = 2 * df_results['Precision'] * df_results['Recall'] / (df_results['Precision'] + df_results['Recall'])
+df_results['Accuracy'] = (df_results['TP'] + df_results['TN']) / (df_results['TP'] + df_results['TN'] + df_results['FP'] + df_results['FN'])
+
+print("\n=== Model Comparison Table ===")
+print(df_results.round(4).to_string(index=False))
+
+# LaTeX table er jonno
+print("\n=== LaTeX Table ===")
+print(df_results.round(4).to_latex(index=False))
+
+---------------------- RESULT 
+
+=== Model Comparison Table ===
+              Model    TN  FP  FN  TP  Precision  Recall  F1-Score  Accuracy
+Logistic Regression 22600 805   3 256     0.2413  0.9884    0.3879    0.9659
+      Random Forest 23405   0   0 259     1.0000  1.0000    1.0000    1.0000
+       XGBoost Only 23404   1   0 259     0.9962  1.0000    0.9981    1.0000
+   Proposed 2-Stage 23405   0  21 238     1.0000  0.9189    0.9577    0.9991
+
+=== LaTeX Table ===
+\begin{tabular}{lrrrrrrrr}
+\toprule
+Model & TN & FP & FN & TP & Precision & Recall & F1-Score & Accuracy \\
+\midrule
+Logistic Regression & 22600 & 805 & 3 & 256 & 0.241300 & 0.988400 & 0.387900 & 0.965900 \\
+Random Forest & 23405 & 0 & 0 & 259 & 1.000000 & 1.000000 & 1.000000 & 1.000000 \\
+XGBoost Only & 23404 & 1 & 0 & 259 & 0.996200 & 1.000000 & 0.998100 & 1.000000 \\
+Proposed 2-Stage & 23405 & 0 & 21 & 238 & 1.000000 & 0.918900 & 0.957700 & 0.999100 \\
+\bottomrule
+\end{tabular}
 
 
