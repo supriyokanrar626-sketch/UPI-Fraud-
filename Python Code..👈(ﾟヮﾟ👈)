@@ -1,1 +1,62 @@
+import pandas as pd
+import numpy as np
+df = pd.read_csv('paysim.csv', nrows=3000000) # 3M tor
+df = df[df['type'].isin(['TRANSFER','CASH_OUT'])]
+print(df.shape) # (2700000, 11) asha uchit
+print(df['isFraud'].sum()) # 3500+ fraud thakbe
+
+-----------------------
+
+print(df.head())
+
+------------------------
+
+# 2. Row filter
+df = df[df['type'].isin(['TRANSFER', 'PAYMENT', 'DEBIT'])]
+df = df[df['amount'] > 0]
+df = df[~((df['oldbalanceOrg'] == 0) & (df['amount'] > 0))]
+
+# 3. Feature engineering
+df['hour'] = df['step'] % 24
+df['day'] = df['step'] // 24
+df['log_amount'] = np.log1p(df['amount'])
+df['errorBalanceOrig'] = df['newbalanceOrig'] + df['amount'] - df['oldbalanceOrg']
+df['errorBalanceDest'] = df['oldbalanceDest'] + df['amount'] - df['newbalanceDest']
+
+# Ratio feature - null asar chance ache
+df['amount_to_oldBalOrig'] = df['amount'] / (df['oldbalanceOrg'] + 1)
+df['amount_to_oldBalDest'] = df['amount'] / (df['oldbalanceDest'] + 1)
+
+# 4. Column drop
+df = df.drop(['step', 'nameOrig', 'nameDest', 'isFlaggedFraud'], axis=1)
+df = pd.get_dummies(df, columns=['type'], drop_first=True)
+
+# 5. Null handle - ekhane kor
+df = df.dropna() # sobcheye easy
+
+# 6. Dedupe
+df = df.drop_duplicates()
+df = df.reset_index(drop=True)
+
+print("Final shape:", df.shape)
+print("Null count:", df.isnull().sum().sum())
+print(df['isFraud'].value_counts())
+
+------------------------
+
+from sklearn.model_selection import train_test_split
+X = df.drop('isFraud', axis=1)
+y = df['isFraud']
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X, y, test_size=0.2, stratify=y, random_state=42
+)
+print("Train shape:", X_train.shape)
+print("Test shape:", X_test.shape)
+print("Train fraud:", y_train.sum(), "Test fraud:", y_test.sum())
+print("Train fraud %:", y_train.mean()*100, "Test fraud %:", y_test.mean()*100)
+
+-----------------------------------
+
+
 
